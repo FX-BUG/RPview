@@ -2,7 +2,7 @@
 
 GIF, PNG, JPG, MP4 파일을 캔버스에 자유롭게 배치해 참고 이미지/영상으로 활용하는 레퍼런스 뷰어입니다.
 
-<img width="2495" height="1489" alt="image" src="https://github.com/user-attachments/assets/32f721ec-f2a1-4757-a287-4b1ac5e966c5" />
+![GIF](https://github.com/user-attachments/assets/63b03d8c-1a59-4b61-9518-eadad705a92c)
 
 <br>
 
