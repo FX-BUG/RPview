@@ -7282,7 +7282,8 @@ class VerticalTabBar(QWidget):
     panel_toggle_requested = pyqtSignal()
 
     W          = 22   # strip width
-    TAB_H      = 55   # height per tab
+    TAB_H_MIN  = 55   # minimum height per tab
+    TAB_PAD    = 24   # padding around label (top+bottom)
     ADD_H      = 24   # height of '+' button
     TOP_MARGIN = 24   # reserved for overlay titlebar
 
@@ -7311,12 +7312,24 @@ class VerticalTabBar(QWidget):
 
     # ── geometry helpers ──────────────────────────────────────────────────────
 
+    def _tab_h(self, i):
+        """Dynamic height for tab i based on label length."""
+        fm = QFontMetrics(get_ui_font(9))
+        name = self._names[i] if i < len(self._names) else ''
+        return max(self.TAB_H_MIN, fm.horizontalAdvance(name) + self.TAB_PAD)
+
+    def _tab_top(self, i):
+        """Y-coordinate of the top of tab i."""
+        y = self.TOP_MARGIN
+        for j in range(i):
+            y += self._tab_h(j)
+        return y
+
     def _tab_rect(self, i):
-        return QRect(0, self.TOP_MARGIN + i * self.TAB_H, self.W, self.TAB_H)
+        return QRect(0, self._tab_top(i), self.W, self._tab_h(i))
 
     def _add_rect(self):
-        return QRect(0, self.TOP_MARGIN + len(self._names) * self.TAB_H,
-                     self.W, self.ADD_H)
+        return QRect(0, self._tab_top(len(self._names)), self.W, self.ADD_H)
 
     def _idx_at(self, pos):
         if pos.y() < self.TOP_MARGIN:
@@ -7399,7 +7412,7 @@ class VerticalTabBar(QWidget):
             p.drawLine(3, r.bottom(), self.W - 4, r.bottom())
 
             # Rotated label (reads bottom-to-top — natural for left-side tabs)
-            display = name if len(name) <= 5 else name[:4] + '…'
+            display = name
             color = (QColor(0xff, 0xff, 0xff) if active else
                      QColor(0xcc, 0xcc, 0xcc) if hover else
                      QColor(0x66, 0x66, 0x66))
@@ -7427,9 +7440,9 @@ class VerticalTabBar(QWidget):
         if self._dragging and self._drag_idx >= 0:
             drop = self._drop_idx_at(self._drag_y)
             if drop < self._drag_idx:
-                line_y = self.TOP_MARGIN + drop * self.TAB_H
+                line_y = self._tab_top(drop)
             else:
-                line_y = self.TOP_MARGIN + (drop + 1) * self.TAB_H
+                line_y = self._tab_top(drop + 1)
             p.setPen(QPen(QColor(0x00, 0x78, 0xd4), 2))
             p.drawLine(1, line_y, self.W - 1, line_y)
 
@@ -7461,9 +7474,11 @@ class VerticalTabBar(QWidget):
             self.update()
 
     def _drop_idx_at(self, y):
-        rel = y - self.TOP_MARGIN
-        idx = int(rel // self.TAB_H)
-        return max(0, min(idx, len(self._names) - 1))
+        for i in range(len(self._names)):
+            r = self._tab_rect(i)
+            if y < r.center().y():
+                return i
+        return max(0, len(self._names) - 1)
 
     def leaveEvent(self, e):
         if self._hover != -1:
@@ -8395,12 +8410,12 @@ class MainWindow(QMainWindow):
 
         # Tab management (loadState may override these)
         self._tabs = [{
-            'name': '탭 1', 'items': [], 'groups': [], 'item_float_pos': {},
+            'name': 'Tab_01', 'items': [], 'groups': [], 'item_float_pos': {},
             'pan_offset': QPoint(0, 0), 'pan_float': [0.0, 0.0],
             'canvas_scale': CanvasWidget.DEFAULT_SCALE, 'bg_color': QColor(30, 30, 30),
         }]
         self._active_tab = 0
-        self.vtab_bar.setTabs(['탭 1'], 0)
+        self.vtab_bar.setTabs(['Tab_01'], 0)
 
         self.setMouseTracking(True)
         QApplication.instance().installEventFilter(self)
@@ -9399,7 +9414,7 @@ class MainWindow(QMainWindow):
                     }
                     self._tabs.append(tab)
                 if not self._tabs:
-                    self._tabs = [{'name': '탭 1', 'items': [], 'groups': [],
+                    self._tabs = [{'name': 'Tab_01', 'items': [], 'groups': [],
                                    'item_float_pos': {}, 'pan_offset': QPoint(0,0),
                                    'pan_float': [0.0,0.0], 'canvas_scale': CanvasWidget.DEFAULT_SCALE,
                                    'bg_color': QColor(30,30,30)}]
@@ -9474,7 +9489,7 @@ class MainWindow(QMainWindow):
         if reply != QMessageBox.Yes:
             return
         self._clear_all_items()
-        self._tabs = [{'name': '탭 1', 'items': [], 'groups': [], 'item_float_pos': {},
+        self._tabs = [{'name': 'Tab_01', 'items': [], 'groups': [], 'item_float_pos': {},
                        'pan_offset': QPoint(0, 0), 'pan_float': [0.0, 0.0],
                        'canvas_scale': CanvasWidget.DEFAULT_SCALE,
                        'bg_color': QColor(30, 30, 30)}]
