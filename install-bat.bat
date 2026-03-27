@@ -39,7 +39,7 @@ powershell -Command "Invoke-WebRequest -Uri 'https://bootstrap.pypa.io/get-pip.p
 del "%PYTHON_DIR%\get-pip.py"
 
 echo [4/4] Installing packages...
-"%PYTHON_EXE%" -m pip install PyQt5 opencv-python numpy Pillow --no-warn-script-location -q
+"%PYTHON_EXE%" -m pip install PyQt5 opencv-python numpy Pillow psutil --no-warn-script-location -q
 
 echo.
 echo ==========================================
