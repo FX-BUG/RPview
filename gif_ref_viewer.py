@@ -2177,7 +2177,11 @@ class _TrimOverlay(QWidget):
         if hasattr(self._item, 'showFrame'):
             self._item.showFrame(frame)
         elif hasattr(self._item, 'movie'):
-            self._item.movie.jumpToFrame(frame)
+            mv = self._item.movie
+            if mv.state() == QMovie.NotRunning:
+                mv.start()
+                mv.setPaused(True)
+            mv.jumpToFrame(frame)
         self.update()
 
     # ── 확인 / 취소 / 초기화 ─────────────────────────────────────────────────
@@ -3975,6 +3979,10 @@ class GifItem(QWidget, ResizeMixin, SelectableMixin):
             self._trim_start, self._trim_end = self._trim_end, self._trim_start
         self.control_bar.slider.setMinimum(self._trim_start)
         self.control_bar.slider.setMaximum(self._trim_end)
+        # jumpToFrame은 NotRunning 상태에서 동작하지 않으므로 Paused로 복구
+        if self.movie.state() == QMovie.NotRunning:
+            self.movie.start()
+            self.movie.setPaused(True)
         self.movie.jumpToFrame(self._trim_start)
         # jumpToFrame 후 movie 는 Paused 상태 — is_playing 동기화
         self.is_playing = False
@@ -4208,8 +4216,14 @@ class GifItem(QWidget, ResizeMixin, SelectableMixin):
 
     def togglePlay(self):
         self.is_playing = not self.is_playing
-        self.movie.setPaused(not self.is_playing)
         self.control_bar.play_btn.setText('||' if self.is_playing else '>')
+        if self.is_playing:
+            if self.movie.state() == QMovie.NotRunning:
+                self.movie.start()
+            else:
+                self.movie.setPaused(False)
+        else:
+            self.movie.setPaused(True)
 
     def setSpeed(self, speed):
         self._playback_speed = speed
@@ -4252,6 +4266,9 @@ class GifItem(QWidget, ResizeMixin, SelectableMixin):
             while self.movie.currentFrameNumber() < target:
                 self.movie.jumpToNextFrame()
         else:
+            if self.movie.state() == QMovie.NotRunning:
+                self.movie.start()
+                self.movie.setPaused(True)
             self.movie.jumpToFrame(target)
 
     def keyPressEvent(self, e):
