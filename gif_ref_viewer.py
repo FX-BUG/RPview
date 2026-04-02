@@ -8,6 +8,7 @@ import os
 import json
 import math
 import atexit
+import threading
 try:
     import psutil as _psutil
     _PSUTIL_PROC = _psutil.Process(os.getpid())
@@ -3848,6 +3849,230 @@ class ImageItem(QWidget, ResizeMixin, SelectableMixin):
         self.deleteLater()
 
 
+# ── _read_gif_metadata ─────────────────────────────────────────────────────────
+
+def _read_gif_metadata(path):
+    """GIF 파일 구조를 직접 파싱해 픽셀 디코딩 없이 프레임 수와 딜레이(ms)를 반환.
+    PIL seek 루프 대비 대용량 GIF에서 수십 배 빠름.
+    Returns (frame_count: int, durations: list[int])
+    """
+    import struct
+    frame_count  = 0
+    durations    = []
+    pending_delay = 100  # ms, 기본값
+
+    try:
+        with open(path, 'rb') as f:
+            header = f.read(6)
+            if header[:3] != b'GIF':
+                return 0, []
+
+            lsd   = f.read(7)
+            flags = lsd[4]
+            if (flags >> 7) & 1:                          # Global Color Table 존재
+                f.seek(3 * (2 ** ((flags & 0x7) + 1)), 1)
+
+            while True:
+                byte = f.read(1)
+                if not byte or byte == b'\x3B':           # EOF 또는 Trailer
+                    break
+
+                if byte == b'\x2C':                       # Image Descriptor → 프레임
+                    frame_count += 1
+                    durations.append(max(10, pending_delay))
+                    pending_delay = 100
+                    img_desc = f.read(9)
+                    if len(img_desc) < 9:
+                        break
+                    if (img_desc[8] >> 7) & 1:            # Local Color Table 존재
+                        f.seek(3 * (2 ** ((img_desc[8] & 0x7) + 1)), 1)
+                    f.read(1)                              # LZW minimum code size
+                    while True:                            # sub-block 건너뜀
+                        sz = f.read(1)
+                        if not sz or sz == b'\x00':
+                            break
+                        f.seek(sz[0], 1)
+
+                elif byte == b'\x21':                     # Extension
+                    label = f.read(1)
+                    if label == b'\xF9':                  # Graphic Control Extension
+                        block_size = f.read(1)
+                        if block_size and block_size[0] == 4:
+                            gce = f.read(4)
+                            delay_cs = struct.unpack('<H', gce[1:3])[0]
+                            pending_delay = max(10, delay_cs * 10)
+                            f.read(1)                     # block terminator
+                        else:
+                            while True:
+                                sz = f.read(1)
+                                if not sz or sz == b'\x00':
+                                    break
+                                f.seek(sz[0], 1)
+                    else:                                 # 기타 extension 건너뜀
+                        while True:
+                            sz = f.read(1)
+                            if not sz or sz == b'\x00':
+                                break
+                            f.seek(sz[0], 1)
+    except Exception:
+        pass
+
+    return frame_count, durations
+
+
+# ── _GifSlidingCache ───────────────────────────────────────────────────────────
+
+class _GifSlidingCache:
+    """Sliding-window GIF frame cache.
+
+    Background thread decodes frames sequentially via Pillow and stores them
+    at display resolution (original × decode_scale), not original resolution.
+    Memory ≈ WINDOW × (orig_w × scale) × (orig_h × scale) × 4 bytes.
+    """
+    WINDOW = 40  # max frames in memory at once
+
+    def __init__(self, gif_path, decode_scale=1.0):
+        from PIL import Image
+        self._path         = gif_path
+        self._lock         = threading.Lock()
+        self._cache        = {}           # frame_idx → QImage at decode_scale resolution
+        self._stop_evt     = threading.Event()
+        self._seek_evt     = threading.Event()
+        self._playhead     = 0
+        self._decode_scale = max(0.05, decode_scale)
+
+        # ── read metadata (픽셀 디코딩 없이 GIF 구조 파싱 → 대용량 GIF도 빠름) ──
+        Image.MAX_IMAGE_PIXELS = None          # 디컴프레션 봄 체크 해제
+        pil = Image.open(gif_path)
+        self.original_size = QSize(pil.width, pil.height)
+        pil.close()
+        self._frame_count, self._durations = _read_gif_metadata(gif_path)
+        if self._frame_count == 0:             # 파싱 실패 시 폴백
+            self._frame_count = 1
+            self._durations   = [100]
+
+        self._thread = threading.Thread(target=self._loader, daemon=True)
+        self._thread.start()
+
+    # ── public API ──────────────────────────────────────────────────────────
+
+    @property
+    def frame_count(self):
+        return self._frame_count
+
+    def duration(self, idx):
+        if 0 <= idx < len(self._durations):
+            return self._durations[idx]
+        return 100
+
+    def set_playhead(self, idx):
+        """Tell the cache where the playhead is. Always wakes the loader."""
+        self._playhead = idx
+        self._seek_evt.set()    # wake loader on every position update
+
+    def set_scale(self, new_scale):
+        """Update decode resolution. Invalidates cache if scale changed >30%."""
+        new_scale = max(0.05, new_scale)
+        ratio = new_scale / self._decode_scale
+        if ratio > 1.3 or ratio < 0.77:    # >30% change
+            self._decode_scale = new_scale
+            with self._lock:
+                self._cache.clear()
+            self._seek_evt.set()
+
+    def get_image(self, idx):
+        """Return QImage for frame idx, or None if not yet decoded."""
+        with self._lock:
+            return self._cache.get(idx)
+
+    def close(self):
+        self._stop_evt.set()
+        self._seek_evt.set()
+        self._thread.join(timeout=1.0)
+        with self._lock:
+            self._cache.clear()
+
+    # ── background loader ────────────────────────────────────────────────────
+
+    def _loader(self):
+        from PIL import Image
+        Image.MAX_IMAGE_PIXELS = None          # 대용량 GIF 프레임 디코딩 허용
+        # Pillow 10.0.0에서 Image.BILINEAR 제거됨 → 호환성 처리
+        _BILINEAR = getattr(getattr(Image, 'Resampling', None), 'BILINEAR', None) or getattr(Image, 'BILINEAR', 2)
+        pil          = None
+        file_scale   = None   # decode_scale used when pil was opened
+        decoded_upto = -1     # highest frame index decoded sequentially so far
+
+        while not self._stop_evt.is_set():
+            self._seek_evt.clear()
+            decode_scale = self._decode_scale
+            playhead     = self._playhead
+            end          = min(self._frame_count, playhead + self.WINDOW)
+            save_from    = max(0, playhead - 5)
+
+            # Reopen file if scale changed or if we need to go far back
+            need_reopen = (pil is None or
+                           file_scale != decode_scale or
+                           decoded_upto > end or
+                           playhead < decoded_upto - self.WINDOW)
+            # 루프백 감지: 현재 배치가 끝났는데 playhead 프레임이 캐시에 없음
+            if not need_reopen and decoded_upto >= end - 1 and decoded_upto > playhead:
+                with self._lock:
+                    if playhead not in self._cache:
+                        need_reopen = True
+            if need_reopen:
+                if pil is not None:
+                    pil.close()
+                pil          = Image.open(self._path)
+                file_scale   = decode_scale
+                decoded_upto = -1
+
+            try:
+                for i in range(decoded_upto + 1, end):
+                    if self._stop_evt.is_set() or self._seek_evt.is_set():
+                        break
+                    try:
+                        pil.seek(i)      # sequential: just reads next frame
+                    except EOFError:
+                        # 실제 프레임 수가 메타데이터와 다를 경우 자동 보정
+                        if i < self._frame_count:
+                            self._frame_count = i
+                        break
+                    decoded_upto = i
+                    if i < save_from:
+                        continue         # advance composite state but don't store
+                    with self._lock:
+                        if i in self._cache:
+                            continue     # already stored
+                    frame = pil.convert('RGBA')
+                    tw = max(1, int(frame.width  * decode_scale))
+                    th = max(1, int(frame.height * decode_scale))
+                    if tw != frame.width or th != frame.height:
+                        frame = frame.resize((tw, th), _BILINEAR)
+                    data = frame.tobytes('raw', 'RGBA')
+                    qimg = QImage(data, tw, th, 4 * tw, QImage.Format_RGBA8888).copy()
+                    with self._lock:
+                        self._cache[i] = qimg
+                        self._evict(playhead)
+            except Exception as _e:
+                import traceback; traceback.print_exc()
+                if pil is not None:
+                    pil.close()
+                pil          = None
+                decoded_upto = -1
+
+            self._seek_evt.wait(timeout=0.01)
+
+        if pil is not None:
+            pil.close()
+
+    def _evict(self, playhead):
+        """Called with lock held. Remove frames farthest from playhead."""
+        while len(self._cache) > self.WINDOW:
+            farthest = max(self._cache.keys(), key=lambda k: abs(k - playhead))
+            del self._cache[farthest]
+
+
 # ── GifItem ────────────────────────────────────────────────────────────────────
 
 class GifItem(QWidget, ResizeMixin, SelectableMixin):
@@ -3869,26 +4094,27 @@ class GifItem(QWidget, ResizeMixin, SelectableMixin):
         self.control_bar = GifControlBar(self)
         self.control_bar.hide()
 
-        self.movie = QMovie(gif_path)
-        file_size = os.path.getsize(gif_path) if os.path.exists(gif_path) else 0
-        _GIF_CACHE_LIMIT = 4 * 1024 * 1024  # 4 MB
-        if file_size < _GIF_CACHE_LIMIT:
-            self.movie.setCacheMode(QMovie.CacheAll)
-            self._gif_cached = True
-        else:
-            self.movie.setCacheMode(QMovie.CacheNone)
-            self._gif_cached = False
-        self.movie.jumpToFrame(0)
-        self.original_size = self.movie.currentImage().size()
+        # ── initial scale (before cache is created) ──
+        _MAX = 240
+        from PIL import Image as _PILImage
+        _pil_tmp = _PILImage.open(gif_path)
+        _native_w, _native_h = _pil_tmp.width, _pil_tmp.height
+        _pil_tmp.close()
+        _native_max = max(_native_w, _native_h)
+        _init_scale = min(1.0, _MAX / _native_max) if _native_max > _MAX else 1.0
+
+        # ── sliding-window cache (replaces QMovie) ──
+        self._cache = _GifSlidingCache(gif_path, decode_scale=_init_scale)
+        self.original_size = self._cache.original_size
         if not self.original_size.isValid() or self.original_size.width() == 0:
             self.original_size = QSize(200, 200)
-        _MAX = 240
-        native_max = max(self.original_size.width(), self.original_size.height())
-        self.current_scale = min(1.0, _MAX / native_max) if native_max > _MAX else 1.0
+        self.frame_count   = self._cache.frame_count
+        self._current_frame = 0
+
+        self.current_scale = _init_scale
         self._opacity = 1.0
         self._opacity_effect = QGraphicsOpacityEffect(self)
         self._opacity_effect.setOpacity(1.0)
-        # opacity is handled in _ContentLabel.paintEvent — no widget-level effect
         self._flip_h = False
         self._flip_v = False
         self._rotation = 0
@@ -3896,9 +4122,6 @@ class GifItem(QWidget, ResizeMixin, SelectableMixin):
         self._blend_mode = QPainter.CompositionMode_SourceOver
         self._z_always_on_top = False
         self._invert = False
-        self.movie.frameChanged.connect(self._onGifFrame)
-        self.movie.start()
-        self.frame_count = self.movie.frameCount()
         self._trim_start = 0
         self._trim_end = max(0, self.frame_count - 1)
         self._hover_bar = _ItemHoverBar(self, self)
@@ -3908,6 +4131,12 @@ class GifItem(QWidget, ResizeMixin, SelectableMixin):
         self.is_playing = True
         self._playback_speed = 1.025
         self.setMouseTracking(True)
+
+        # ── playback timer ──
+        self._play_timer = QTimer(self)
+        self._play_timer.setSingleShot(True)
+        self._play_timer.timeout.connect(self._tick)
+
         self.control_bar.play_btn.clicked.connect(self.togglePlay)
         self.control_bar.slider.sliderMoved.connect(self._onSlider)
         self.control_bar.slider.setMaximum(max(0, self.frame_count - 1))
@@ -3927,7 +4156,7 @@ class GifItem(QWidget, ResizeMixin, SelectableMixin):
         self._slider_debounce.setInterval(0)
         self._slider_debounce.timeout.connect(self._do_slider_seek)
         self.updateSize()
-        self.setSpeed(1.025)
+        self._start_play_timer()
 
     def getState(self):
         return {'type': 'gif', 'path': self.file_path,
@@ -3974,25 +4203,21 @@ class GifItem(QWidget, ResizeMixin, SelectableMixin):
 
     def setTrim(self, start, end):
         self._trim_start = max(0, min(start, self.frame_count - 1))
-        self._trim_end = max(0, min(end, self.frame_count - 1))
+        self._trim_end   = max(0, min(end,   self.frame_count - 1))
         if self._trim_start > self._trim_end:
             self._trim_start, self._trim_end = self._trim_end, self._trim_start
         self.control_bar.slider.setMinimum(self._trim_start)
         self.control_bar.slider.setMaximum(self._trim_end)
-        # jumpToFrame은 NotRunning 상태에서 동작하지 않으므로 Paused로 복구
-        if self.movie.state() == QMovie.NotRunning:
-            self.movie.start()
-            self.movie.setPaused(True)
-        self.movie.jumpToFrame(self._trim_start)
-        # jumpToFrame 후 movie 는 Paused 상태 — is_playing 동기화
         self.is_playing = False
+        self._play_timer.stop()
         self.control_bar.play_btn.setText('>')
+        self._display_frame(self._trim_start)
         if hasattr(self, '_hover_bar'):
             self._hover_bar.refresh()
 
     def resetTrim(self):
         self._trim_start = 0
-        self._trim_end = max(0, self.frame_count - 1)
+        self._trim_end   = max(0, self.frame_count - 1)
         self.control_bar.slider.setMinimum(0)
         self.control_bar.slider.setMaximum(max(0, self.frame_count - 1))
         if hasattr(self, '_hover_bar'):
@@ -4017,43 +4242,61 @@ class GifItem(QWidget, ResizeMixin, SelectableMixin):
         self.updateSize()
         self._label.update()
 
-    def _onGifFrame(self, _):
-        pix = self.movie.currentPixmap()
-        if not pix.isNull():
-            self._label.setPixmap(pix)
-        if not hasattr(self, 'is_playing'):
+
+    def _start_play_timer(self):
+        dur = self._cache.duration(self._current_frame)
+        self._play_timer.start(max(1, int(dur / self._playback_speed)))
+
+    def _tick(self):
+        """Advance one frame and schedule the next tick."""
+        if not self.is_playing:
             return
-        cur = self.movie.currentFrameNumber()
-        if self.is_playing:
-            if cur < self._trim_start:
-                # trim 시작점 이전 → 앞으로 점프 (CacheNone도 전진은 동작)
-                self.movie.jumpToFrame(self._trim_start)
-                cur = self._trim_start
-            elif cur > self._trim_end:
-                if self._gif_cached:
-                    # CacheAll: 바로 시작점으로 후진
-                    self.movie.jumpToFrame(self._trim_start)
-                    cur = self._trim_start
-                # CacheNone: 후진 불가 → 끝까지 재생 후 frame 0에서 위의 cur < trim_start 처리로 점프
-        rel = cur - self._trim_start + 1
+        # 로더가 실제 프레임 수를 보정했을 경우 반영
+        actual_last = self._cache.frame_count - 1
+        if self._trim_end > actual_last:
+            self._trim_end = actual_last
+            self.control_bar.slider.setMaximum(actual_last)
+        nxt = self._current_frame + 1
+        if nxt > self._trim_end:
+            nxt = self._trim_start
+        # Frame not decoded yet — retry in 5 ms without advancing position
+        if self._cache.get_image(nxt) is None:
+            self._cache.set_playhead(nxt)  # 로더에 위치 힌트 전달
+            self._play_timer.start(5)
+            return
+        self._display_frame(nxt)
+        self._start_play_timer()
+
+    def _display_frame(self, idx):
+        """Display frame idx and update slider/label."""
+        idx = max(self._trim_start, min(self._trim_end, idx))
+        self._current_frame = idx
+        self._cache.set_playhead(idx)
+        qimg = self._cache.get_image(idx)
+        if qimg is not None and not qimg.isNull():
+            dw = max(1, int(self.original_size.width()  * self.current_scale))
+            dh = max(1, int(self.original_size.height() * self.current_scale))
+            if qimg.width() != dw or qimg.height() != dh:
+                qimg = qimg.scaled(dw, dh, Qt.IgnoreAspectRatio, Qt.SmoothTransformation)
+            self._label.setPixmap(QPixmap.fromImage(qimg))
+        rel   = idx - self._trim_start + 1
         total = self._trim_end - self._trim_start + 1
         self.control_bar.frame_label.setText(f'{rel} / {total}')
         if not self.control_bar.slider._pressed:
             self.control_bar.slider.blockSignals(True)
-            self.control_bar.slider.setValue(cur)
+            self.control_bar.slider.setValue(idx)
             self.control_bar.slider.blockSignals(False)
 
     def updateSize(self):
         cs = self._rm_csize()
         self._label.setFixedSize(cs)
         self.adjustSize()
+        if hasattr(self, '_cache'):
+            self._cache.set_scale(self.current_scale)
         if hasattr(self, 'control_bar') and self.control_bar.isVisible():
             self.control_bar.setFixedWidth(max(150, cs.width()))
             bx, by = self._control_bar_pos()
             self.control_bar.move(bx, by)
-        pix = self.movie.currentPixmap()
-        if not pix.isNull():
-            self._label.setPixmap(pix)
 
     def _control_bar_pos(self):
         cs = self._rm_csize()
@@ -4218,16 +4461,12 @@ class GifItem(QWidget, ResizeMixin, SelectableMixin):
         self.is_playing = not self.is_playing
         self.control_bar.play_btn.setText('||' if self.is_playing else '>')
         if self.is_playing:
-            if self.movie.state() == QMovie.NotRunning:
-                self.movie.start()
-            else:
-                self.movie.setPaused(False)
+            self._start_play_timer()
         else:
-            self.movie.setPaused(True)
+            self._play_timer.stop()
 
     def setSpeed(self, speed):
         self._playback_speed = speed
-        self.movie.setSpeed(int(speed * 100))
         self.control_bar.setActiveSpeed(speed)
 
     def _set_culled(self, culled: bool):
@@ -4235,14 +4474,14 @@ class GifItem(QWidget, ResizeMixin, SelectableMixin):
             return
         self._culled = culled
         if culled:
-            self.movie.setPaused(True)
+            self._play_timer.stop()
         else:
             if self.is_playing:
-                self.movie.setPaused(False)
+                self._start_play_timer()
 
     def _onStepPressed(self, direction):
         self.is_playing = False
-        self.movie.setPaused(True)
+        self._play_timer.stop()
         self.control_bar.play_btn.setText('>')
         self._step_dir = direction
         self._doStep()
@@ -4256,20 +4495,9 @@ class GifItem(QWidget, ResizeMixin, SelectableMixin):
         self._step_repeat_timer.start()
 
     def _doStep(self):
-        cur = self.movie.currentFrameNumber()
-        target = max(0, min(self.frame_count - 1, cur + self._step_dir))
-        if not self._gif_cached and target < cur:
-            # CacheNone: jumpToFrame 후진 불가 — 처음부터 다시 재생해 target까지 진행
-            self.movie.stop()
-            self.movie.start()
-            self.movie.setPaused(True)
-            while self.movie.currentFrameNumber() < target:
-                self.movie.jumpToNextFrame()
-        else:
-            if self.movie.state() == QMovie.NotRunning:
-                self.movie.start()
-                self.movie.setPaused(True)
-            self.movie.jumpToFrame(target)
+        target = max(self._trim_start,
+                     min(self._trim_end, self._current_frame + self._step_dir))
+        self._display_frame(target)
 
     def keyPressEvent(self, e):
         if e.key() in (Qt.Key_Left, Qt.Key_Right) and not e.isAutoRepeat():
@@ -4305,26 +4533,9 @@ class GifItem(QWidget, ResizeMixin, SelectableMixin):
         value = self._pending_slider_val
         if self.is_playing:
             self.is_playing = False
-            self.movie.setPaused(True)
+            self._play_timer.stop()
             self.control_bar.play_btn.setText('>')
-        # Ensure movie is in a seekable state before jumping
-        if self.movie.state() == QMovie.NotRunning:
-            self.movie.start()
-            self.movie.setPaused(True)
-        if not self._gif_cached:
-            cur = self.movie.currentFrameNumber()
-            if value < cur:
-                # 역방향: 처음부터 다시 재생
-                self.movie.stop()
-                self.movie.start()
-                self.movie.setPaused(True)
-            while self.movie.currentFrameNumber() < value:
-                self.movie.jumpToNextFrame()
-        else:
-            self.movie.jumpToFrame(value)
-        rel = value - self._trim_start + 1
-        total = self._trim_end - self._trim_start + 1
-        self.control_bar.frame_label.setText(f'{rel} / {total}')
+        self._display_frame(value)
 
     def _showContextMenu(self, pos):
         menu = QMenu(self)
@@ -4437,7 +4648,8 @@ class GifItem(QWidget, ResizeMixin, SelectableMixin):
 
     def cleanup(self):
         _deregister_canvas_item(self)
-        self.movie.stop()
+        self._play_timer.stop()
+        self._cache.close()
         if hasattr(self, '_hover_bar') and self._hover_bar:
             self._hover_bar.deleteLater()
         if hasattr(self, '_blend_bar') and self._blend_bar:
